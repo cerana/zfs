@@ -385,6 +385,36 @@ zfs_log_history(zfs_cmd_t *zc)
 	history_str_free(buf);
 }
 
+int
+zone_dataset_visible(const char *dataset, int *writable)
+{
+	zoneid_t zoneid;
+	uint64_t id;
+
+	if (dataset == NULL || *dataset == '\0')
+		return (0);
+
+	zoneid = crgetzoneid(current_cred());
+	if (zoneid == GLOBAL_ZONEID)
+	{
+		/* Global zone */
+		if (writable != NULL)
+			*writable = 1;
+		return (1);
+	}
+
+	if (dsl_prop_get_integer(dataset, "namespace", &id, NULL))
+		return (0);
+
+	if (zoneid == id) {
+		if (writable != NULL)
+			*writable = 1;
+		return (1);
+	}
+
+	return (0);
+}
+
 /*
  * Policy for top-level read operations (list pools).  Requires no privileges,
  * and can be used in the local zone, as there is no associated dataset.
@@ -644,6 +674,7 @@ zfs_secpolicy_setprop(const char *dsname, zfs_prop_t prop, nvpair_t *propval,
 	default:
 		break;
 	case ZFS_PROP_ZONED:
+	case ZFS_PROP_NAMESPACE:
 		/*
 		 * Disallow setting of 'zoned' from within a local zone.
 		 */

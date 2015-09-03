@@ -456,6 +456,9 @@ zfs_prop_init(void)
 	zprop_register_hidden(ZFS_PROP_PREV_SNAP, "prevsnap", PROP_TYPE_STRING,
 	    PROP_READONLY, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME, "PREVSNAP");
 
+	zprop_register_hidden(ZFS_PROP_NAMESPACE, "namespace", PROP_TYPE_NUMBER,
+	    PROP_INHERIT, ZFS_TYPE_DATASET, "NAMESPACE");
+
 	/*
 	 * Property to be removed once libbe is integrated
 	 */
