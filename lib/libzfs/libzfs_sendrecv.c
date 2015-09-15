@@ -667,6 +667,8 @@ send_iterate_prop(zfs_handle_t *zhp, nvlist_t *nv)
 	while ((elem = nvlist_next_nvpair(zhp->zfs_props, elem)) != NULL) {
 		char *propname = nvpair_name(elem);
 		zfs_prop_t prop = zfs_name_to_prop(propname);
+		char *strval;
+		uint64_t intval;
 		nvlist_t *propnv;
 
 		if (!zfs_prop_user(propname)) {
@@ -716,17 +718,35 @@ send_iterate_prop(zfs_handle_t *zhp, nvlist_t *nv)
 				continue;
 		}
 
-		if (zfs_prop_user(propname) ||
-		    zfs_prop_get_type(prop) == PROP_TYPE_STRING) {
-			char *value;
-			verify(nvlist_lookup_string(propnv,
-			    ZPROP_VALUE, &value) == 0);
-			VERIFY(0 == nvlist_add_string(nv, propname, value));
-		} else {
-			uint64_t value;
-			verify(nvlist_lookup_uint64(propnv,
-			    ZPROP_VALUE, &value) == 0);
-			VERIFY(0 == nvlist_add_uint64(nv, propname, value));
+		if (zfs_prop_user(propname)) {
+			strval = fnvlist_lookup_string(propnv, ZPROP_VALUE);
+			fnvlist_add_string(nv, propname, strval);
+			continue;
+		}
+
+		switch (zfs_prop_get_type(prop)) {
+		case PROP_TYPE_INDEX:
+			break;
+			if (nvlist_lookup_uint64(propnv,
+			    ZPROP_VALUE, &intval) != 0) {
+				strval = fnvlist_lookup_string(propnv,
+				    ZPROP_VALUE);
+				VERIFY0(zfs_prop_string_to_index(prop,
+				    strval, &intval));
+			}
+			fnvlist_add_uint64(nv, propname, intval);
+			break;
+		case PROP_TYPE_STRING:
+			strval = fnvlist_lookup_string(propnv, ZPROP_VALUE);
+			fnvlist_add_string(nv, propname, strval);
+			break;
+		case PROP_TYPE_NUMBER:
+			intval = fnvlist_lookup_uint64(propnv, ZPROP_VALUE);
+			fnvlist_add_uint64(nv, propname, intval);
+			break;
+		default:
+			VERIFY(0); /* not allowed */
+			break;
 		}
 	}
 }
@@ -1014,37 +1034,33 @@ send_progress_thread(void *arg)
 {
 	progress_arg_t *pa = arg;
 
-	zfs_cmd_t zc = {"\0"};
 	zfs_handle_t *zhp = pa->pa_zhp;
-	libzfs_handle_t *hdl = zhp->zfs_hdl;
-	unsigned long long bytes;
+	uint64_t bytes;
 	char buf[16];
 
 	time_t t;
 	struct tm *tm;
 
 	assert(zhp->zfs_type == ZFS_TYPE_SNAPSHOT);
-	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
 
 	if (!pa->pa_parsable)
 		(void) fprintf(stderr, "TIME        SENT   SNAPSHOT\n");
 
 	/*
-	 * Print the progress from ZFS_IOC_SEND_PROGRESS every second.
+	 * Print the progress from lzc_send_progress every second.
 	 */
 	for (;;) {
 		(void) sleep(1);
 
-		zc.zc_cookie = pa->pa_fd;
-		if (zfs_ioctl(hdl, ZFS_IOC_SEND_PROGRESS, &zc) != 0)
+		if (lzc_send_progress(zhp->zfs_name, pa->pa_fd, &bytes) != 0)
 			return ((void *)-1);
 
 		(void) time(&t);
 		tm = localtime(&t);
-		bytes = zc.zc_cookie;
 
 		if (pa->pa_parsable) {
-			(void) fprintf(stderr, "%02d:%02d:%02d\t%llu\t%s\n",
+			(void) fprintf(stderr,
+			    "%02d:%02d:%02d\t%"PRIu64"\t%s\n",
 			    tm->tm_hour, tm->tm_min, tm->tm_sec,
 			    bytes, zhp->zfs_name);
 		} else {
@@ -1171,7 +1187,7 @@ dump_snapshot(zfs_handle_t *zhp, void *arg)
 	if (!sdd->dryrun) {
 		/*
 		 * If progress reporting is requested, spawn a new thread to
-		 * poll ZFS_IOC_SEND_PROGRESS at a regular interval.
+		 * poll lzc_send_progress at a regular interval.
 		 */
 		if (sdd->progress) {
 			pa.pa_zhp = zhp;
@@ -1212,11 +1228,11 @@ dump_filesystem(zfs_handle_t *zhp, void *arg)
 	int rv = 0;
 	send_dump_data_t *sdd = arg;
 	boolean_t missingfrom = B_FALSE;
-	zfs_cmd_t zc = {"\0"};
+	char name[ZFS_MAXNAMELEN];
 
-	(void) snprintf(zc.zc_name, sizeof (zc.zc_name), "%s@%s",
+	(void) snprintf(name, sizeof (name), "%s@%s",
 	    zhp->zfs_name, sdd->tosnap);
-	if (ioctl(zhp->zfs_hdl->libzfs_fd, ZFS_IOC_OBJSET_STATS, &zc) != 0) {
+	if (lzc_exists(name) != B_TRUE) {
 		(void) fprintf(stderr, dgettext(TEXT_DOMAIN,
 		    "WARNING: could not send %s@%s: does not exist\n"),
 		    zhp->zfs_name, sdd->tosnap);
@@ -1232,10 +1248,9 @@ dump_filesystem(zfs_handle_t *zhp, void *arg)
 		 * is a clone).  If we're doing non-recursive, then let
 		 * them get the error.
 		 */
-		(void) snprintf(zc.zc_name, sizeof (zc.zc_name), "%s@%s",
+		(void) snprintf(name, sizeof (name), "%s@%s",
 		    zhp->zfs_name, sdd->fromsnap);
-		if (ioctl(zhp->zfs_hdl->libzfs_fd,
-		    ZFS_IOC_OBJSET_STATS, &zc) != 0) {
+		if (lzc_exists(name) != B_TRUE) {
 			missingfrom = B_TRUE;
 		}
 	}
@@ -1599,7 +1614,8 @@ zfs_send(zfs_handle_t *zhp, const char *fromsnap, const char *tosnap,
 			goto err_out;
 
 		if (sdd.snapholds != NULL) {
-			err = zfs_hold_nvl(zhp, sdd.cleanup_fd, sdd.snapholds);
+			err = zfs_hold_nvl(zhp, sdd.cleanup_fd, sdd.snapholds,
+			    NULL);
 			if (err != 0)
 				goto stderr_out;
 
@@ -1788,7 +1804,6 @@ recv_rename(libzfs_handle_t *hdl, const char *name, const char *tryname,
     int baselen, char *newname, recvflags_t *flags)
 {
 	static int seq;
-	zfs_cmd_t zc = {"\0"};
 	int err;
 	prop_changelist_t *clp;
 	zfs_handle_t *zhp;
@@ -1805,19 +1820,14 @@ recv_rename(libzfs_handle_t *hdl, const char *name, const char *tryname,
 	if (err)
 		return (err);
 
-	zc.zc_objset_type = DMU_OST_ZFS;
-	(void) strlcpy(zc.zc_name, name, sizeof (zc.zc_name));
-
 	if (tryname) {
 		(void) strcpy(newname, tryname);
 
-		(void) strlcpy(zc.zc_value, tryname, sizeof (zc.zc_value));
-
 		if (flags->verbose) {
 			(void) printf("attempting rename %s to %s\n",
-			    zc.zc_name, zc.zc_value);
+			    name, tryname);
 		}
-		err = ioctl(hdl->libzfs_fd, ZFS_IOC_RENAME, &zc);
+		err = lzc_rename(name, tryname, NULL, NULL);
 		if (err == 0)
 			changelist_rename(clp, name, tryname);
 	} else {
@@ -1829,13 +1839,12 @@ recv_rename(libzfs_handle_t *hdl, const char *name, const char *tryname,
 
 		(void) snprintf(newname, ZFS_MAXNAMELEN, "%.*srecv-%u-%u",
 		    baselen, name, getpid(), seq);
-		(void) strlcpy(zc.zc_value, newname, sizeof (zc.zc_value));
 
 		if (flags->verbose) {
 			(void) printf("failed - trying rename %s to %s\n",
-			    zc.zc_name, zc.zc_value);
+			    name, newname);
 		}
-		err = ioctl(hdl->libzfs_fd, ZFS_IOC_RENAME, &zc);
+		err = lzc_rename(name, newname, NULL, NULL);
 		if (err == 0)
 			changelist_rename(clp, name, newname);
 		if (err && flags->verbose) {
@@ -1860,7 +1869,7 @@ static int
 recv_destroy(libzfs_handle_t *hdl, const char *name, int baselen,
     char *newname, recvflags_t *flags)
 {
-	zfs_cmd_t zc = {"\0"};
+	nvlist_t *opts = NULL;
 	int err = 0;
 	prop_changelist_t *clp;
 	zfs_handle_t *zhp;
@@ -1883,17 +1892,22 @@ recv_destroy(libzfs_handle_t *hdl, const char *name, int baselen,
 	if (err)
 		return (err);
 
-	zc.zc_objset_type = DMU_OST_ZFS;
-	zc.zc_defer_destroy = defer;
-	(void) strlcpy(zc.zc_name, name, sizeof (zc.zc_name));
+	if (defer) {
+		opts = fnvlist_alloc();
+		fnvlist_add_boolean(opts, "defer");
+	}
 
 	if (flags->verbose)
-		(void) printf("attempting destroy %s\n", zc.zc_name);
-	err = ioctl(hdl->libzfs_fd, ZFS_IOC_DESTROY, &zc);
+		(void) printf("attempting destroy %s\n", name);
+	err = lzc_destroy_one(name, opts);
+
+	if (defer)
+		fnvlist_free(opts);
+
 	if (err == 0) {
 		if (flags->verbose)
 			(void) printf("success\n");
-		changelist_remove(clp, zc.zc_name);
+		changelist_remove(clp, name);
 	}
 
 	(void) changelist_postfix(clp);
@@ -2122,7 +2136,6 @@ again:
 			    stream_originguid, originguid)) {
 			case 1: {
 				/* promote it! */
-				zfs_cmd_t zc = {"\0"};
 				nvlist_t *origin_nvfs;
 				char *origin_fsname;
 
@@ -2133,11 +2146,7 @@ again:
 				    NULL);
 				VERIFY(0 == nvlist_lookup_string(origin_nvfs,
 				    "name", &origin_fsname));
-				(void) strlcpy(zc.zc_value, origin_fsname,
-				    sizeof (zc.zc_value));
-				(void) strlcpy(zc.zc_name, fsname,
-				    sizeof (zc.zc_name));
-				error = zfs_ioctl(hdl, ZFS_IOC_PROMOTE, &zc);
+				error = lzc_promote(fsname, NULL, NULL);
 				if (error == 0)
 					progress = B_TRUE;
 				break;
@@ -2197,17 +2206,15 @@ again:
 			if (0 == nvlist_lookup_nvlist(stream_nvfs, "snapprops",
 			    &props) && 0 == nvlist_lookup_nvlist(props,
 			    stream_snapname, &props)) {
-				zfs_cmd_t zc = {"\0"};
+				char name[ZFS_MAXNAMELEN];
+				nvlist_t *opts = fnvlist_alloc();
 
-				zc.zc_cookie = B_TRUE; /* received */
-				(void) snprintf(zc.zc_name, sizeof (zc.zc_name),
+				(void) snprintf(name, sizeof (name),
 				    "%s@%s", fsname, nvpair_name(snapelem));
-				if (zcmd_write_src_nvlist(hdl, &zc,
-				    props) == 0) {
-					(void) zfs_ioctl(hdl,
-					    ZFS_IOC_SET_PROP, &zc);
-					zcmd_free_nvlists(&zc);
-				}
+
+				fnvlist_add_boolean(opts, "received");
+				(void) lzc_set_props(name, props, opts, NULL);
+				fnvlist_free(opts);
 			}
 
 			/* check for different snapname */
@@ -3027,14 +3034,11 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 	zcmd_free_nvlists(&zc);
 
 	if (err == 0 && snapprops_nvlist) {
-		zfs_cmd_t zc2 = {"\0"};
-
-		(void) strcpy(zc2.zc_name, zc.zc_value);
-		zc2.zc_cookie = B_TRUE; /* received */
-		if (zcmd_write_src_nvlist(hdl, &zc2, snapprops_nvlist) == 0) {
-			(void) zfs_ioctl(hdl, ZFS_IOC_SET_PROP, &zc2);
-			zcmd_free_nvlists(&zc2);
-		}
+		nvlist_t *opts = fnvlist_alloc();
+		fnvlist_add_boolean(opts, "received");
+		(void) lzc_set_props(zc.zc_value, snapprops_nvlist, opts,
+		    NULL);
+		fnvlist_free(opts);
 	}
 
 	if (err && (ioctl_errno == ENOENT || ioctl_errno == EEXIST)) {

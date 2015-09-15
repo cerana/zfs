@@ -523,7 +523,7 @@ parse_depth(char *opt, int *flags)
 		    gettext("Depth can not be negative.\n"));
 		usage(B_FALSE);
 	}
-	*flags |= (ZFS_ITER_DEPTH_LIMIT|ZFS_ITER_RECURSE);
+	*flags |= (ZFS_ITER_DEPTH_LIMIT);
 	return (depth);
 }
 
@@ -708,14 +708,11 @@ zfs_do_clone(int argc, char **argv)
 	}
 
 	/* pass to libzfs */
-	ret = zfs_clone(zhp, argv[1], props);
+	ret = zfs_clone(zhp, argv[1], props, history_str);
 
 	/* create the mountpoint if necessary */
 	if (ret == 0) {
-		if (log_history) {
-			(void) zpool_log_history(g_zfs, history_str);
-			log_history = B_FALSE;
-		}
+		log_history = B_FALSE;
 
 		ret = zfs_mount_and_share(g_zfs, argv[1], ZFS_TYPE_DATASET);
 	}
@@ -896,13 +893,11 @@ zfs_do_create(int argc, char **argv)
 	}
 
 	/* pass to libzfs */
-	if (zfs_create(g_zfs, argv[0], type, props) != 0)
+	if (zfs_create(g_zfs, argv[0], type, props,
+	    (log_history) ? history_str : NULL) != 0)
 		goto error;
 
-	if (log_history) {
-		(void) zpool_log_history(g_zfs, history_str);
-		log_history = B_FALSE;
-	}
+	log_history = B_FALSE;
 
 	ret = zfs_mount_and_share(g_zfs, argv[0], ZFS_TYPE_DATASET);
 error:
@@ -948,6 +943,7 @@ typedef struct destroy_cbdata {
 	int64_t		cb_snapused;
 	char		*cb_snapspec;
 	char		*cb_bookmark;
+	const char	*cb_log_history;
 } destroy_cbdata_t;
 
 /*
@@ -1052,16 +1048,22 @@ destroy_callback(zfs_handle_t *zhp, void *data)
 		fnvlist_add_boolean(cb->cb_batchedsnaps, name);
 	} else {
 		int error = zfs_destroy_snaps_nvl(g_zfs,
-		    cb->cb_batchedsnaps, B_FALSE);
+		    cb->cb_batchedsnaps, B_FALSE, cb->cb_log_history);
+
+		if (error == 0 && !nvlist_empty(cb->cb_batchedsnaps))
+			cb->cb_log_history = NULL;
+
 		fnvlist_free(cb->cb_batchedsnaps);
 		cb->cb_batchedsnaps = fnvlist_alloc();
 
 		if (error != 0 ||
 		    zfs_unmount(zhp, NULL, cb->cb_force ? MS_FORCE : 0) != 0 ||
-		    zfs_destroy(zhp, cb->cb_defer_destroy) != 0) {
+		    zfs_destroy(zhp, cb->cb_defer_destroy,
+		    cb->cb_log_history) != 0) {
 			zfs_close(zhp);
 			return (-1);
 		}
+		cb->cb_log_history = NULL;
 	}
 
 	zfs_close(zhp);
@@ -1268,6 +1270,8 @@ zfs_do_destroy(int argc, char **argv)
 		usage(B_FALSE);
 	}
 
+	cb.cb_log_history = (log_history) ? history_str : NULL;
+
 	at = strchr(argv[0], '@');
 	pound = strchr(argv[0], '#');
 	if (at != NULL) {
@@ -1316,16 +1320,23 @@ zfs_do_destroy(int argc, char **argv)
 				err = destroy_clones(&cb);
 				if (err == 0) {
 					err = zfs_destroy_snaps_nvl(g_zfs,
-					    cb.cb_batchedsnaps, B_FALSE);
+					    cb.cb_batchedsnaps, B_FALSE,
+					    cb.cb_log_history);
 				}
 				if (err != 0) {
 					rv = 1;
 					goto out;
 				}
+				cb.cb_log_history = NULL;
+				log_history = B_FALSE;
 			}
 			if (err == 0) {
 				err = zfs_destroy_snaps_nvl(g_zfs, cb.cb_nvl,
-				    cb.cb_defer_destroy);
+				    cb.cb_defer_destroy, cb.cb_log_history);
+				if (err == 0) {
+					cb.cb_log_history = NULL;
+					log_history = B_FALSE;
+				}
 			}
 		}
 
@@ -1333,7 +1344,7 @@ zfs_do_destroy(int argc, char **argv)
 			rv = 1;
 	} else if (pound != NULL) {
 		int err;
-		nvlist_t *nvl;
+		nvlist_t *nvl, *opts;
 
 		if (cb.cb_dryrun) {
 			(void) fprintf(stderr,
@@ -1362,13 +1373,19 @@ zfs_do_destroy(int argc, char **argv)
 		nvl = fnvlist_alloc();
 		fnvlist_add_boolean(nvl, argv[0]);
 
-		err = lzc_destroy_bookmarks(nvl, NULL);
+		opts = fnvlist_alloc();
+		if (log_history)
+			fnvlist_add_string(opts, "log_history", history_str);
+
+		err = lzc_destroy_bookmarks_ext(nvl, opts, NULL);
 		if (err != 0) {
 			(void) zfs_standard_error(g_zfs, err,
 			    "cannot destroy bookmark");
-		}
+		} else
+			log_history = B_FALSE;
 
 		nvlist_free(cb.cb_nvl);
+		fnvlist_free(opts);
 
 		return (err);
 	} else {
@@ -1425,8 +1442,9 @@ zfs_do_destroy(int argc, char **argv)
 		err = destroy_callback(zhp, &cb);
 		zhp = NULL;
 		if (err == 0) {
+			log_history = B_FALSE;
 			err = zfs_destroy_snaps_nvl(g_zfs,
-			    cb.cb_batchedsnaps, cb.cb_defer_destroy);
+			    cb.cb_batchedsnaps, cb.cb_defer_destroy, NULL);
 		}
 		if (err != 0)
 			rv = 1;
@@ -1483,7 +1501,6 @@ get_callback(zfs_handle_t *zhp, void *data)
 	zprop_source_t sourcetype;
 	char source[ZFS_MAXNAMELEN];
 	zprop_get_cbdata_t *cbp = data;
-	nvlist_t *user_props = zfs_get_user_props(zhp);
 	zprop_list_t *pl = cbp->cb_proplist;
 	nvlist_t *propval;
 	char *strval;
@@ -1549,7 +1566,7 @@ get_callback(zfs_handle_t *zhp, void *data)
 			zprop_print_one_property(zfs_get_name(zhp), cbp,
 			    pl->pl_user_prop, buf, sourcetype, source, NULL);
 		} else {
-			if (nvlist_lookup_nvlist(user_props,
+			if (nvlist_lookup_nvlist(zhp->zfs_props,
 			    pl->pl_user_prop, &propval) != 0) {
 				if (pl->pl_all)
 					continue;
@@ -1592,7 +1609,7 @@ static int
 zfs_do_get(int argc, char **argv)
 {
 	zprop_get_cbdata_t cb = { 0 };
-	int i, c, flags = ZFS_ITER_ARGS_CAN_BE_PATHS;
+	int i, c, flags = ZFS_ITER_ARGS_CAN_BE_PATHS|ZFS_ITER_TYPES_SPECIFIED;
 	int types = ZFS_TYPE_DATASET;
 	char *value, *fields;
 	int ret = 0;
@@ -1730,7 +1747,6 @@ zfs_do_get(int argc, char **argv)
 
 		case 't':
 			types = 0;
-			flags &= ~ZFS_ITER_PROP_LISTSNAPS;
 			while (*optarg != '\0') {
 				static char *type_subopts[] = { "filesystem",
 				    "volume", "snapshot", "bookmark",
@@ -1834,7 +1850,23 @@ zfs_do_get(int argc, char **argv)
 typedef struct inherit_cbdata {
 	const char *cb_propname;
 	boolean_t cb_received;
+	char *cb_log_history;
 } inherit_cbdata_t;
+
+static int
+inherit_cb(zfs_handle_t *zhp, void *data)
+{
+	inherit_cbdata_t *cb = data;
+	int ret;
+
+	return (zfs_prop_inherit(zhp, cb->cb_propname, cb->cb_received,
+	    cb->cb_log_history) != 0);
+
+	if (ret)
+		cb->cb_log_history = NULL;
+
+	return (ret);
+}
 
 static int
 inherit_recurse_cb(zfs_handle_t *zhp, void *data)
@@ -1850,15 +1882,7 @@ inherit_recurse_cb(zfs_handle_t *zhp, void *data)
 	    !zfs_prop_valid_for_type(prop, zfs_get_type(zhp), B_FALSE))
 		return (0);
 
-	return (zfs_prop_inherit(zhp, cb->cb_propname, cb->cb_received) != 0);
-}
-
-static int
-inherit_cb(zfs_handle_t *zhp, void *data)
-{
-	inherit_cbdata_t *cb = data;
-
-	return (zfs_prop_inherit(zhp, cb->cb_propname, cb->cb_received) != 0);
+	return (inherit_cb(zhp, data));
 }
 
 static int
@@ -1942,6 +1966,8 @@ zfs_do_inherit(int argc, char **argv)
 
 	cb.cb_propname = propname;
 	cb.cb_received = received;
+	cb.cb_log_history = (log_history) ? history_str : NULL;
+	log_history = B_FALSE;
 
 	if (flags & ZFS_ITER_RECURSE) {
 		ret = zfs_for_each(argc, argv, flags, ZFS_TYPE_DATASET,
@@ -2053,7 +2079,7 @@ upgrade_set_callback(zfs_handle_t *zhp, void *data)
 			(void) zpool_log_history(g_zfs, history_str);
 			log_history = B_FALSE;
 		}
-		if (zfs_prop_set(zhp, "version", verstr) == 0)
+		if (zfs_prop_set(zhp, "version", verstr, NULL) == 0)
 			cb->cb_numupgraded++;
 		else
 			cb->cb_numfailed++;
@@ -2083,7 +2109,7 @@ zfs_do_upgrade(int argc, char **argv)
 	int ret = 0;
 	upgrade_cbdata_t cb = { 0 };
 	signed char c;
-	int flags = ZFS_ITER_ARGS_CAN_BE_PATHS;
+	int flags = ZFS_ITER_ARGS_CAN_BE_PATHS | ZFS_ITER_TYPES_SPECIFIED;
 
 	/* check options */
 	while ((c = getopt(argc, argv, "rvV:a")) != -1) {
@@ -2963,7 +2989,6 @@ print_dataset(zfs_handle_t *zhp, list_cbdata_t *cb)
 	zprop_list_t *pl = cb->cb_proplist;
 	boolean_t first = B_TRUE;
 	char property[ZFS_MAXPROPLEN];
-	nvlist_t *userprops = zfs_get_user_props(zhp);
 	nvlist_t *propval;
 	char *propstr;
 	boolean_t right_justify;
@@ -3006,7 +3031,7 @@ print_dataset(zfs_handle_t *zhp, list_cbdata_t *cb)
 				propstr = property;
 			right_justify = B_TRUE;
 		} else {
-			if (nvlist_lookup_nvlist(userprops,
+			if (nvlist_lookup_nvlist(zhp->zfs_props,
 			    pl->pl_user_prop, &propval) != 0)
 				propstr = "-";
 			else
@@ -3057,14 +3082,13 @@ zfs_do_list(int argc, char **argv)
 	static char default_fields[] =
 	    "name,used,available,referenced,mountpoint";
 	int types = ZFS_TYPE_DATASET;
-	boolean_t types_specified = B_FALSE;
 	char *fields = NULL;
 	list_cbdata_t cb = { 0 };
 	char *value;
 	int limit = 0;
 	int ret = 0;
 	zfs_sort_column_t *sortcol = NULL;
-	int flags = ZFS_ITER_PROP_LISTSNAPS | ZFS_ITER_ARGS_CAN_BE_PATHS;
+	int flags = ZFS_ITER_ARGS_CAN_BE_PATHS;
 
 	/* check options */
 	while ((c = getopt(argc, argv, "HS:d:o:prs:t:")) != -1) {
@@ -3103,8 +3127,7 @@ zfs_do_list(int argc, char **argv)
 			break;
 		case 't':
 			types = 0;
-			types_specified = B_TRUE;
-			flags &= ~ZFS_ITER_PROP_LISTSNAPS;
+			flags |= ZFS_ITER_TYPES_SPECIFIED;
 			while (*optarg != '\0') {
 				static char *type_subopts[] = { "filesystem",
 				    "volume", "snapshot", "snap", "bookmark",
@@ -3165,7 +3188,7 @@ zfs_do_list(int argc, char **argv)
 	/*
 	 * If "-o space" and no types were specified, don't display snapshots.
 	 */
-	if (strcmp(fields, "space") == 0 && types_specified == B_FALSE)
+	if (strcmp(fields, "space") == 0 && !(flags & ZFS_ITER_TYPES_SPECIFIED))
 		types &= ~ZFS_TYPE_SNAPSHOT;
 
 	/*
@@ -3178,6 +3201,11 @@ zfs_do_list(int argc, char **argv)
 		usage(B_FALSE);
 
 	cb.cb_first = B_TRUE;
+
+	/* -d <depth> trumps -r. */
+	if ((flags & (ZFS_ITER_RECURSE | ZFS_ITER_DEPTH_LIMIT)) ==
+	    (ZFS_ITER_RECURSE | ZFS_ITER_DEPTH_LIMIT))
+		flags &= ~ZFS_ITER_RECURSE;
 
 	ret = zfs_for_each(argc, argv, flags, types, sortcol, &cb.cb_proplist,
 	    limit, list_callback, &cb);
@@ -3273,7 +3301,9 @@ zfs_do_rename(int argc, char **argv)
 		return (1);
 	}
 
-	ret = (zfs_rename(zhp, argv[1], recurse, force_unmount) != 0);
+	ret = (zfs_rename(zhp, argv[1], recurse, force_unmount, history_str) !=
+	    0);
+	log_history = B_FALSE;
 
 	zfs_close(zhp);
 	return (ret);
@@ -3313,8 +3343,8 @@ zfs_do_promote(int argc, char **argv)
 	if (zhp == NULL)
 		return (1);
 
-	ret = (zfs_promote(zhp) != 0);
-
+	ret = (zfs_promote(zhp, (log_history) ? history_str : NULL) != 0);
+	log_history = B_FALSE;
 
 	zfs_close(zhp);
 	return (ret);
@@ -3483,7 +3513,8 @@ zfs_do_rollback(int argc, char **argv)
 	/*
 	 * Rollback parent to the given snapshot.
 	 */
-	ret = zfs_rollback(zhp, snap, force);
+	ret = zfs_rollback(zhp, snap, force, (log_history) ? history_str :
+	    NULL);
 
 out:
 	zfs_close(snap);
@@ -3500,13 +3531,17 @@ out:
  *
  * Sets the given properties for all datasets specified on the command line.
  */
+typedef struct set_cbdata {
+	nvlist_t	*cb_props;
+	char		*cb_log_history;
+} set_cbdata_t;
 
 static int
 set_callback(zfs_handle_t *zhp, void *data)
 {
-	nvlist_t *props = data;
+	set_cbdata_t *cbp = data;
 
-	if (zfs_prop_set_list(zhp, props) != 0) {
+	if (zfs_prop_set_list(zhp, cbp->cb_props, cbp->cb_log_history) != 0) {
 		switch (libzfs_errno(g_zfs)) {
 		case EZFS_MOUNTFAILED:
 			(void) fprintf(stderr, gettext("property may be set "
@@ -3519,13 +3554,14 @@ set_callback(zfs_handle_t *zhp, void *data)
 		}
 		return (1);
 	}
+	cbp->cb_log_history = NULL;
 	return (0);
 }
 
 static int
 zfs_do_set(int argc, char **argv)
 {
-	nvlist_t *props = NULL;
+	set_cbdata_t cb = {.cb_props = NULL};
 	int ds_start = -1; /* argv idx of first dataset arg */
 	int ret = 0;
 	int i;
@@ -3572,18 +3608,21 @@ zfs_do_set(int argc, char **argv)
 	}
 
 	/* Populate a list of property settings */
-	if (nvlist_alloc(&props, NV_UNIQUE_NAME, 0) != 0)
+	if (nvlist_alloc(&cb.cb_props, NV_UNIQUE_NAME, 0) != 0)
 		nomem();
 	for (i = 1; i < ds_start; i++) {
-		if ((ret = parseprop(props, argv[i])) != 0)
+		if ((ret = parseprop(cb.cb_props, argv[i])) != 0)
 			goto error;
 	}
 
+	cb.cb_log_history = (log_history) ? history_str : NULL;
+	log_history = B_FALSE;
+
 	ret = zfs_for_each(argc - ds_start, argv + ds_start, 0,
-	    ZFS_TYPE_DATASET, NULL, NULL, 0, set_callback, props);
+	    ZFS_TYPE_DATASET, NULL, NULL, 0, set_callback, &cb);
 
 error:
-	nvlist_free(props);
+	nvlist_free(cb.cb_props);
 	return (ret);
 }
 
@@ -3685,7 +3724,8 @@ zfs_do_snapshot(int argc, char **argv)
 			goto usage;
 	}
 
-	ret = zfs_snapshot_nvl(g_zfs, sd.sd_nvl, props);
+	ret = zfs_snapshot_nvl(g_zfs, sd.sd_nvl, props,
+	    (log_history) ? history_str : NULL);
 	nvlist_free(sd.sd_nvl);
 	nvlist_free(props);
 	if (ret != 0 && multiple_snaps)
@@ -5383,11 +5423,17 @@ zfs_do_hold_rele_impl(int argc, char **argv, boolean_t holding)
 			continue;
 		}
 		if (holding) {
-			if (zfs_hold(zhp, delim+1, tag, recursive, -1) != 0)
+			if (zfs_hold(zhp, delim+1, tag, recursive, -1,
+			    (log_history) ? history_str : NULL) != 0)
 				++errors;
+			else
+				log_history = B_FALSE;
 		} else {
-			if (zfs_release(zhp, delim+1, tag, recursive) != 0)
+			if (zfs_release(zhp, delim+1, tag, recursive,
+			    (log_history) ? history_str : NULL) != 0)
 				++errors;
+			else
+				log_history = B_FALSE;
 		}
 		zfs_close(zhp);
 	}
@@ -6611,7 +6657,7 @@ zfs_do_bookmark(int argc, char **argv)
 {
 	char snapname[ZFS_MAXNAMELEN];
 	zfs_handle_t *zhp;
-	nvlist_t *nvl;
+	nvlist_t *nvl, *opts;
 	int ret = 0;
 	int c;
 
@@ -6663,9 +6709,13 @@ zfs_do_bookmark(int argc, char **argv)
 
 
 	nvl = fnvlist_alloc();
+	opts = fnvlist_alloc();
+	if (log_history)
+		fnvlist_add_string(opts, "log_history", history_str);
 	fnvlist_add_string(nvl, argv[1], snapname);
-	ret = lzc_bookmark(nvl, NULL);
+	ret = lzc_bookmark_ext(nvl, opts, NULL);
 	fnvlist_free(nvl);
+	fnvlist_free(opts);
 
 	if (ret != 0) {
 		const char *err_msg;
@@ -6697,6 +6747,8 @@ zfs_do_bookmark(int argc, char **argv)
 		}
 		(void) fprintf(stderr, "%s: %s\n", errbuf,
 		    dgettext(TEXT_DOMAIN, err_msg));
+	} else {
+		log_history = B_FALSE;
 	}
 
 	return (ret != 0);

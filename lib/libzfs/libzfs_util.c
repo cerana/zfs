@@ -1664,6 +1664,8 @@ zprop_parse_value(libzfs_handle_t *hdl, nvpair_t *elem, int prop,
 			    zprop_values(prop, type));
 			goto error;
 		}
+		*ivalp = 0;
+		*svalp = value;
 		break;
 
 	default:
